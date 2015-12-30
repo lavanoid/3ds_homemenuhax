@@ -1,13 +1,15 @@
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <errno.h>
 #include <3ds.h>
 
 #include "archive.h"
 
 u32 extdata_archives_lowpathdata[TotalExtdataArchives][3];
-FS_archive extdata_archives[TotalExtdataArchives];
+FS_Archive extdata_archives[TotalExtdataArchives];
 u32 extdata_initialized = 0;
 
 Result open_extdata()
@@ -17,7 +19,7 @@ Result open_extdata()
 	u32 extdataID_homemenu, extdataID_theme;
 	u8 region=0;
 
-	ret = initCfgu();
+	ret = cfguInit();
 	if(ret!=0)
 	{
 		printf("initCfgu() failed: 0x%08x\n", (unsigned int)ret);
@@ -31,7 +33,7 @@ Result open_extdata()
 		return ret;
 	}
 
-	exitCfgu();
+	cfguExit();
 
 	if(region==1)//USA
 	{
@@ -51,7 +53,7 @@ Result open_extdata()
 
 	for(pos=0; pos<TotalExtdataArchives; pos++)
 	{
-		extdata_archives[pos].id = ARCH_EXTDATA;
+		extdata_archives[pos].id = ARCHIVE_EXTDATA;
 		extdata_archives[pos].lowPath.type = PATH_BINARY;
 		extdata_archives[pos].lowPath.size = 0xc;
 		extdata_archives[pos].lowPath.data = (u8*)extdata_archives_lowpathdata[pos];
@@ -63,7 +65,7 @@ Result open_extdata()
 	extdata_archives_lowpathdata[HomeMenu_Extdata][1] = extdataID_homemenu;//extdataID-low
 	extdata_archives_lowpathdata[Theme_Extdata][1] = extdataID_theme;//extdataID-low
 
-	ret = FSUSER_OpenArchive(NULL, &extdata_archives[HomeMenu_Extdata]);
+	ret = FSUSER_OpenArchive(&extdata_archives[HomeMenu_Extdata]);
 	if(ret!=0)
 	{
 		printf("Failed to open homemenu extdata with extdataID=0x%08x, retval: 0x%08x\n", (unsigned int)extdataID_homemenu, (unsigned int)ret);
@@ -71,10 +73,11 @@ Result open_extdata()
 	}
 	extdata_initialized |= 0x1;
 
-	ret = FSUSER_OpenArchive(NULL, &extdata_archives[Theme_Extdata]);
+	ret = FSUSER_OpenArchive(&extdata_archives[Theme_Extdata]);
 	if(ret!=0)
 	{
 		printf("Failed to open theme extdata with extdataID=0x%08x, retval: 0x%08x\n", (unsigned int)extdataID_theme, (unsigned int)ret);
+		printf("Exit this app, then goto Home Menu theme-settings so that Home Menu can create the theme extdata.\n");
 		return ret;
 	}
 	extdata_initialized |= 0x2;
@@ -88,8 +91,20 @@ void close_extdata()
 
 	for(pos=0; pos<TotalExtdataArchives; pos++)
 	{
-		if(extdata_initialized & (1<<pos))FSUSER_CloseArchive(NULL, &extdata_archives[pos]);
+		if(extdata_initialized & (1<<pos))FSUSER_CloseArchive(&extdata_archives[pos]);
 	}
+}
+
+Result archive_deletefile(Archive archive, char *path)
+{
+	if(archive==SDArchive)
+	{
+		if(unlink(path)==-1)return errno;
+
+		return 0;
+	}
+
+	return FSUSER_DeleteFile(extdata_archives[archive], fsMakePath(PATH_ASCII, path));
 }
 
 Result archive_getfilesize(Archive archive, char *path, u32 *outsize)
@@ -98,22 +113,30 @@ Result archive_getfilesize(Archive archive, char *path, u32 *outsize)
 	struct stat filestats;
 	u64 tmp64=0;
 	Handle filehandle=0;
-
-	char filepath[256];
+	FILE *f = NULL;
+	int fd=0;
 
 	if(archive==SDArchive)
 	{
-		memset(filepath, 0, 256);
-		strncpy(filepath, path, 255);
+		f = fopen(path, "r");
+		if(f==NULL)return errno;
 
-		if(stat(filepath, &filestats)==-1)return errno;
+		fd = fileno(f);
+		if(fd==-1)
+		{
+			fclose(f);
+			return errno;
+		}
+
+		if(fstat(fd, &filestats)==-1)return errno;
+		fclose(f);
 
 		*outsize = filestats.st_size;
 
 		return 0;
 	}
 
-	ret = FSUSER_OpenFile(NULL, &filehandle, extdata_archives[archive], FS_makePath(PATH_CHAR, path), 1, 0);
+	ret = FSUSER_OpenFile(&filehandle, extdata_archives[archive], fsMakePath(PATH_ASCII, path), 1, 0);
 	if(ret!=0)return ret;
 
 	ret = FSFILE_GetSize(filehandle, &tmp64);
@@ -150,7 +173,7 @@ Result archive_readfile(Archive archive, char *path, u8 *buffer, u32 size)
 		return 0;
 	}
 
-	ret = FSUSER_OpenFile(NULL, &filehandle, extdata_archives[archive], FS_makePath(PATH_CHAR, path), FS_OPEN_READ, 0);
+	ret = FSUSER_OpenFile(&filehandle, extdata_archives[archive], fsMakePath(PATH_ASCII, path), FS_OPEN_READ, 0);
 	if(ret!=0)return ret;
 
 	ret = FSFILE_Read(filehandle, &tmpval, 0, buffer, size);
@@ -162,12 +185,13 @@ Result archive_readfile(Archive archive, char *path, u8 *buffer, u32 size)
 	return ret;
 }
 
-Result archive_writefile(Archive archive, char *path, u8 *buffer, u32 size)
+Result archive_writefile(Archive archive, char *path, u8 *buffer, u32 size, u32 createsize)
 {
 	Result ret=0;
 	Handle filehandle=0;
 	u32 tmpval=0;
 	FILE *f;
+	u8 *tmpbuf;
 
 	char filepath[256];
 
@@ -177,12 +201,7 @@ Result archive_writefile(Archive archive, char *path, u8 *buffer, u32 size)
 		strncpy(filepath, path, 255);
 
 		f = fopen(filepath, "w+");
-		if(f==NULL)
-		{
-			tmpval = errno;
-			printf("fopen('%s') failed: 0x%08x\n", filepath, (unsigned int)tmpval);
-			return tmpval;
-		}
+		if(f==NULL)return errno;
 
 		tmpval = fwrite(buffer, 1, size, f);
 
@@ -193,8 +212,44 @@ Result archive_writefile(Archive archive, char *path, u8 *buffer, u32 size)
 		return 0;
 	}
 
-	ret = FSUSER_OpenFile(NULL, &filehandle, extdata_archives[archive], FS_makePath(PATH_CHAR, path), FS_OPEN_WRITE, 0);
-	if(ret!=0)return ret;
+	ret = FSUSER_OpenFile(&filehandle, extdata_archives[archive], fsMakePath(PATH_ASCII, path), FS_OPEN_WRITE, 0);
+	if(ret!=0)
+	{
+		if(createsize)
+		{
+			printf("Error 0x%08x was returned while attempting to open the file for writing, attempting file-creation...\n", (unsigned int)ret);
+
+			ret = FSUSER_CreateFile(extdata_archives[archive], fsMakePath(PATH_ASCII, path), 0, createsize);
+			if(ret)
+			{
+				printf("Failed to create the file: 0x%08x.\n", (unsigned int)ret);
+				return ret;
+			}
+
+			ret = FSUSER_OpenFile(&filehandle, extdata_archives[archive], fsMakePath(PATH_ASCII, path), FS_OPEN_WRITE, 0);
+			if(ret)
+			{
+				printf("Failed to open the file after creation: 0x%08x.\n", (unsigned int)ret);
+			}
+
+			if(ret==0 && size!=createsize)
+			{
+				tmpbuf = malloc(createsize);
+				if(tmpbuf==NULL)
+				{
+					FSFILE_Close(filehandle);
+					return -1;
+				}
+				memset(tmpbuf, 0, createsize);
+
+				ret = FSFILE_Write(filehandle, &tmpval, 0, tmpbuf, createsize, FS_WRITE_FLUSH);
+				free(tmpbuf);
+				if(ret)FSFILE_Close(filehandle);
+			}
+		}
+
+		if(ret)return ret;
+	}
 
 	ret = FSFILE_Write(filehandle, &tmpval, 0, buffer, size, FS_WRITE_FLUSH);
 
@@ -205,7 +260,7 @@ Result archive_writefile(Archive archive, char *path, u8 *buffer, u32 size)
 	return ret;
 }
 
-Result archive_copyfile(Archive inarchive, Archive outarchive, char *inpath, char *outpath, u8* buffer, u32 size, u32 maxbufsize, char *display_filepath)
+Result archive_copyfile(Archive inarchive, Archive outarchive, char *inpath, char *outpath, u8* buffer, u32 size, u32 maxbufsize, u32 createsize, char *display_filepath)
 {
 	Result ret=0;
 	u32 filesize=0;
@@ -237,7 +292,7 @@ Result archive_copyfile(Archive inarchive, Archive outarchive, char *inpath, cha
 
 	printf("Writing %s...\n", display_filepath);
 
-	ret = archive_writefile(outarchive, outpath, buffer, size);
+	ret = archive_writefile(outarchive, outpath, buffer, size, createsize);
 	if(ret!=0)
 	{
 		printf("Failed to write file: 0x%08x\n", (unsigned int)ret);
